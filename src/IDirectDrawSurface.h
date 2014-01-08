@@ -42,11 +42,11 @@ struct IDirectDrawSurfaceImpl
 
     HANDLE hfm;
     unsigned short *surface;
-    unsigned short *renderSurface;
     DDSURFACEDESC desc;
     PBITMAPINFO bmi;
     HBITMAP bitmap;
     HDC hDC;
+    CRITICAL_SECTION lock;
     HANDLE thread;
     HANDLE frame;
 

@@ -41,7 +41,7 @@ BOOL CALLBACK EnumChildProc(HWND hWnd, LPARAM lParam)
     HDC bitmapDC = CreateCompatibleDC(hDC);
     HBITMAP bitmap = CreateCompatibleBitmap(hDC, this->width, this->height);
     SelectObject(bitmapDC, bitmap);
-    SetDIBits(bitmapDC, bitmap, 0, this->height, this->renderSurface, this->bmi, DIB_RGB_COLORS);
+    SetDIBits(bitmapDC, bitmap, 0, this->height, this->surface, this->bmi, DIB_RGB_COLORS);
     BitBlt(hDC, 0, 0, size.right, size.bottom, bitmapDC, pos.left, pos.top, SRCCOPY);
     DeleteObject(bitmap);
     DeleteDC(bitmapDC);
@@ -63,7 +63,7 @@ DWORD WINAPI render(IDirectDrawSurfaceImpl *this)
     HGLRC hRC = wglCreateContext(this->dd->hDC);
     wglMakeCurrent(this->dd->hDC, hRC);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5, this->width, this->height, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, this->renderSurface);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5, this->width, this->height, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, this->surface);
 
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
@@ -74,13 +74,17 @@ DWORD WINAPI render(IDirectDrawSurfaceImpl *this)
     {
         tick_start = timeGetTime();
 
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, this->width, this->height, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, this->renderSurface);
+        EnterCriticalSection(&this->lock);
+
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, this->width, this->height, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, this->surface);
+
+        LeaveCriticalSection(&this->lock);
 
         glBegin(GL_TRIANGLE_FAN);
 
         glTexCoord2f(0,0); glVertex2f(-1, 1);
         glTexCoord2f(1,0); glVertex2f( 1, 1);
-        glTexCoord2f(1,1); glVertex2f( 1, -1);        
+        glTexCoord2f(1,1); glVertex2f( 1, -1);
         glTexCoord2f(0,1); glVertex2f(-1, -1);
         glEnd();
 
@@ -179,6 +183,8 @@ IDirectDrawSurfaceImpl *IDirectDrawSurfaceImpl_construct(IDirectDrawImpl *lpDDIm
     ((DWORD *)this->bmi->bmiColors)[1] = this->desc.ddpfPixelFormat.dwGBitMask;
     ((DWORD *)this->bmi->bmiColors)[2] = this->desc.ddpfPixelFormat.dwBBitMask;
 
+    InitializeCriticalSection(&this->lock);
+
     if (this->dwCaps & DDSCAPS_PRIMARYSURFACE)
     {
         dprintf("Starting renderer.\n");
@@ -187,15 +193,9 @@ IDirectDrawSurfaceImpl *IDirectDrawSurfaceImpl_construct(IDirectDrawImpl *lpDDIm
         {
             dprintf("Renderer set to higher priority.\n");
         }
+    }
 
-        this->hfm = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, this->lPitch * this->height, NULL);
-        this->surface = MapViewOfFile(this->hfm, FILE_MAP_WRITE, 0, 0, this->lPitch * this->height);
-        this->renderSurface = MapViewOfFile(this->hfm, FILE_MAP_WRITE, 0, 0, this->lPitch * this->height);
-    }
-    else
-    {
-        this->surface = calloc(1, this->lPitch * this->height);
-    }
+    this->surface = calloc(1, this->lPitch * this->height);
 
     dprintf("IDirectDrawSurface::construct() -> %p\n", this);
     dump_ddsurfacedesc(lpDDSurfaceDesc);
@@ -242,16 +242,9 @@ static ULONG __stdcall _Release(IDirectDrawSurfaceImpl *this)
             dprintf("Renderer stopped.\n");
         }
 
-        if (this->dwCaps & DDSCAPS_PRIMARYSURFACE)
-        {
-            CloseHandle(this->hfm);
-            UnmapViewOfFile(this->surface);
-            UnmapViewOfFile(this->renderSurface);
-        }
-        else
-        {
-            free(this->surface);
-        }
+        free(this->surface);
+
+        DeleteCriticalSection(&this->lock);
 
         if (this->overlayBitmap)
         {
@@ -320,11 +313,13 @@ static HRESULT __stdcall _Blt(IDirectDrawSurfaceImpl *this, LPRECT lpDestRect, L
 
         if (dwFlags & DDBLT_COLORFILL)
         {
+            EnterCriticalSection(&this->lock);
             for (int x = 0; x < dst.right - dst.left; x++) {
                 for (int y = 0; y < dst.bottom - dst.top; y++) {
                     this->surface[x + dst.left + (this->width * (y + dst.top))] = lpDDBltFx->dwFillColor;
                 }
             }
+            LeaveCriticalSection(&this->lock);
         }
 
         if (lpDDSrcSurface)
@@ -334,16 +329,13 @@ static HRESULT __stdcall _Blt(IDirectDrawSurfaceImpl *this, LPRECT lpDestRect, L
             float w_scale = (src.right - src.left) / (float)dst_w;
             float h_scale = (src.bottom - src.top) / (float)dst_h;
 
+            EnterCriticalSection(&this->lock);
             for (int x = 0; x < dst_w; x++) {
                 for (int y = 0; y < dst_h; y++) {
                     this->surface[x + dst.left + (this->width * (y + dst.top))] = srcImpl->surface[((unsigned int)(x * w_scale) + src.left + (srcImpl->width * ((unsigned int)(y * h_scale) + src.top)))];
                 }
             }
-        }
-
-        if (this->dwCaps & DDSCAPS_PRIMARYSURFACE)
-        {
-            FlushViewOfFile(this->surface, this->lPitch * this->height);
+            LeaveCriticalSection(&this->lock);
         }
     }
 
@@ -524,6 +516,8 @@ HRESULT __stdcall _GetDC(IDirectDrawSurfaceImpl *this, HDC FAR *lphDC)
             this->overlayBitmap = CreateDIBSection(this->overlayDC, this->bmi, DIB_RGB_COLORS, (void **)&this->overlay, NULL, 0);
         }
 
+        EnterCriticalSection(&this->lock);
+
         *lphDC = this->overlayDC;
         SelectObject(this->overlayDC, this->overlayBitmap);
     }
@@ -598,6 +592,7 @@ static HRESULT __stdcall _Lock(IDirectDrawSurfaceImpl *this, LPRECT lpDestRect, 
         memcpy(lpDDSurfaceDesc, &this->desc, sizeof(*lpDDSurfaceDesc));
         lpDDSurfaceDesc->dwFlags |= DDSD_LPSURFACE;
         lpDDSurfaceDesc->lpSurface = this->surface;
+        EnterCriticalSection(&this->lock);
     }
 
     dprintf("IDirectDrawSurface::Lock(this=%p, lpDestRect=%p, lpDDSurfaceDesc=%p, dwFlags=%08X, hEvent=%p) -> %08X\n", this, lpDestRect, lpDDSurfaceDesc, (int)dwFlags, hEvent, (int)ret);
@@ -630,6 +625,7 @@ HRESULT __stdcall _ReleaseDC(IDirectDrawSurfaceImpl *this, HDC hDC)
 
         RECT rc = { 0, 0, this->width, this->height };
         FillRect(this->overlayDC, &rc, CreateSolidBrush(RGB(0,0,0)));
+        LeaveCriticalSection(&this->lock);
     }
 
     dprintf("IDirectDrawSurface::ReleaseDC(this=%p, hDC=%08X) -> %08X\n", this, (int)hDC, (int)ret);
@@ -690,10 +686,7 @@ static HRESULT __stdcall _Unlock(IDirectDrawSurfaceImpl *this, LPVOID lpRect)
     }
     else
     {
-        if (this->dwCaps & DDSCAPS_PRIMARYSURFACE)
-        {
-            FlushViewOfFile(this->surface, this->lPitch * this->height);
-        }
+        LeaveCriticalSection(&this->lock);
     }
 
     dprintf("IDirectDrawSurface::Unlock(this=%p, lpRect=%p) -> %08X\n", this, lpRect, (int)ret);
